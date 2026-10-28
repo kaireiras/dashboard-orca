@@ -1,5 +1,5 @@
 <script setup>
-import { ref } from 'vue'
+import { ref, computed } from 'vue'
 import axios from 'axios'
 import * as echarts from 'echarts'
 import VChart from 'vue-echarts'
@@ -16,9 +16,25 @@ const combinedOption = ref({})
 const rollOption = ref({})
 const pitchOption = ref({})
 const yawOption = ref({})
+const depthOption = ref({})
+const pressureOption = ref({})
+const controlOption = ref({})
+const modeOption = ref({})
+
+// Tab per jenis pesan; tab Orca nonaktif kalau topic-nya tidak ada di .mcap
+const tab = ref('attitude')
+const tabs = computed(() => [
+  { id: 'attitude', label: 'Attitude', ok: true },
+  { id: 'depth', label: 'OrcaDepth', ok: !!depthOption.value.series },
+  { id: 'control', label: 'OrcaControl', ok: !!controlOption.value.series }
+])
+const orcaCharts = computed(() => ({
+  depth: [depthOption.value, pressureOption.value],
+  control: [controlOption.value, modeOption.value]
+})[tab.value] ?? [])
 
 // Fungsi pembantu pembuat template opsi ECharts
-const createChartOption = (title, timeData, seriesList, showSlider = false) => ({
+const createChartOption = (title, timeData, seriesList, showSlider = false, yName = 'Derajat (°)') => ({
   backgroundColor: '#18181b',
   title: {
     text: title,
@@ -45,15 +61,15 @@ const createChartOption = (title, timeData, seriesList, showSlider = false) => (
     bottom: showSlider ? '65px' : '28px'
   },
   xAxis: {
-    type: 'category',
-    boundaryGap: false,
-    data: timeData,
+    type: 'value',
+    min: 0,
+    max: fileInfo.value.duration_sec,
     axisLabel: { color: '#a1a1aa', formatter: '{value} s' },
     axisLine: { lineStyle: { color: '#3f3f46' } }
   },
   yAxis: {
     type: 'value',
-    name: 'Derajat (°)',
+    name: yName,
     nameTextStyle: { color: '#a1a1aa' },
     axisLabel: { color: '#a1a1aa' },
     splitLine: { lineStyle: { color: '#27272a' } }
@@ -64,8 +80,11 @@ const createChartOption = (title, timeData, seriesList, showSlider = false) => (
       ? [{ type: 'slider', xAxisIndex: 0, bottom: 10, height: 22, textStyle: { color: '#a1a1aa' } }]
       : [])
   ],
-  series: seriesList
+  series: seriesList.map(s => ({ ...s, data: s.data.map((v, i) => [timeData[i], v]) }))
 })
+
+// Pembuat series garis untuk grafik baru
+const line = (name, data, color) => ({ name, type: 'line', data, showSymbol: false, itemStyle: { color }, lineStyle: { width: 1.5 } })
 
 // Fungsi saat pengguna memilih file .mcap
 const handleFileUpload = async (event) => {
@@ -84,7 +103,7 @@ const handleFileUpload = async (event) => {
       headers: { 'Content-Type': 'multipart/form-data' }
     })
 
-    const { filename, message_count, duration_sec, series } = res.data
+    const { filename, message_count, duration_sec, series, depth, control } = res.data
     fileInfo.value = { filename, message_count, duration_sec }
 
     // 1. Grafik Gabungan (Roll, Pitch, Yaw)
@@ -119,6 +138,30 @@ const handleFileUpload = async (event) => {
       [{ name: 'Yaw', type: 'line', data: series.yaw, showSymbol: false, itemStyle: { color: '#22c55e' }, lineStyle: { width: 1.5 } }],
       true
     )
+
+    depthOption.value = pressureOption.value = controlOption.value = modeOption.value = {}
+
+    // 5-6. OrcaDepth
+    if (depth.time.length) {
+      depthOption.value = createChartOption('5. Depth', depth.time, [line('Depth', depth.depth, '#06b6d4')], false, 'Depth')
+      pressureOption.value = createChartOption('6. Pressure', depth.time, [line('Pressure', depth.pressure, '#e879f9')], false, 'Pressure')
+    }
+
+    // 7-8. OrcaControl: perintah numerik + mode (string, digambar sebagai garis step)
+    if (control.time.length) {
+      const cmd = ['throttle', 'lateral', 'forward', 'yaw']
+      const cmdColor = ['#3b82f6', '#f97316', '#22c55e', '#eab308']
+      controlOption.value = createChartOption('7. Control Command (OrcaControl)', control.time,
+        cmd.map((k, i) => line(k, control[k], cmdColor[i])), false, 'Command')
+
+      const modes = ['arm_mode', 'control_mode', 'gripper_mode', 'source']
+      const modeColor = ['#a78bfa', '#facc15', '#f472b6', '#2dd4bf']
+      const mo = createChartOption('8. Mode & Source (OrcaControl)', control.time,
+        modes.map((k, i) => ({ ...line(k, control[k], modeColor[i]), step: 'end' })), false, '')
+      mo.yAxis = { ...mo.yAxis, type: 'category', data: [...new Set(modes.flatMap(k => control[k]))] }
+      modeOption.value = mo
+    }
+    tab.value = series.time.length ? 'attitude' : depth.time.length ? 'depth' : 'control'
   } catch (err) {
     errorMsg.value = err.response?.data?.detail || 'Gagal terhubung ke server FastAPI (Pastikan backend menyala di port 8000)'
   } finally {
@@ -147,19 +190,29 @@ const handleFileUpload = async (event) => {
 
     <div v-if="errorMsg" class="error-box">{{ errorMsg }}</div>
 
-    <!-- Tampilan 4 Subplot Vertikal Tersinkronisasi -->
+    <nav v-if="fileInfo" class="tabs" role="tablist">
+      <button v-for="t in tabs" :key="t.id" role="tab" class="tab" :class="{ active: tab === t.id }"
+        :aria-selected="tab === t.id" :disabled="!t.ok" @click="tab = t.id">{{ t.label }}</button>
+    </nav>
+
+    <!-- Tampilan Subplot Vertikal Tersinkronisasi, per tab -->
     <main v-if="fileInfo" class="charts-grid">
-      <div class="chart-card main-chart">
-        <v-chart :option="combinedOption" group="attitudeGroup" autoresize />
-      </div>
-      <div class="chart-card sub-chart">
-        <v-chart :option="rollOption" group="attitudeGroup" autoresize />
-      </div>
-      <div class="chart-card sub-chart">
-        <v-chart :option="pitchOption" group="attitudeGroup" autoresize />
-      </div>
-      <div class="chart-card sub-chart-bottom">
-        <v-chart :option="yawOption" group="attitudeGroup" autoresize />
+      <template v-if="tab === 'attitude'">
+        <div class="chart-card main-chart">
+          <v-chart :option="combinedOption" group="attitudeGroup" autoresize />
+        </div>
+        <div class="chart-card sub-chart">
+          <v-chart :option="rollOption" group="attitudeGroup" autoresize />
+        </div>
+        <div class="chart-card sub-chart">
+          <v-chart :option="pitchOption" group="attitudeGroup" autoresize />
+        </div>
+        <div class="chart-card sub-chart-bottom">
+          <v-chart :option="yawOption" group="attitudeGroup" autoresize />
+        </div>
+      </template>
+      <div v-for="(o, i) in orcaCharts" :key="tab + i" class="chart-card sub-chart">
+        <v-chart :option="o" group="attitudeGroup" autoresize />
       </div>
     </main>
 
@@ -259,6 +312,43 @@ body {
   border-radius: 8px;
   color: #fca5a5;
   overflow-wrap: anywhere;
+}
+
+.tabs {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 12px;
+  border-bottom: 1px solid #27272a;
+}
+
+.tab {
+  flex-shrink: 0;
+  padding: 8px 18px;
+  margin-bottom: -1px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 8px 8px 0 0;
+  color: #a1a1aa;
+  font: inherit;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.tab:hover:not(:disabled) {
+  background: #18181b;
+  color: #f4f4f5;
+}
+
+.tab.active {
+  background: #18181b;
+  border-color: #27272a #27272a #18181b;
+  color: #f4f4f5;
+  font-weight: 600;
+}
+
+.tab:disabled {
+  color: #52525b;
+  cursor: not-allowed;
 }
 
 .charts-grid {
